@@ -1,0 +1,510 @@
+# Install necessary packages
+%pip install arch --upgrade
+%pip install pathos
+%pip install yfinance
+%pip install sortedcontainers
+
+# Import necessary modules
+import sys
+import logging
+import psutil
+from pathos.multiprocessing import ProcessingPool as Pool
+import numpy as np
+import pandas as pd
+from collections import deque
+import time
+from sortedcontainers import SortedDict
+import random
+from arch import arch_model
+import threading
+import tracemalloc
+import gc
+import yfinance as yf
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Section 1: Setup and Spread Calibration
+# Fetch MSFT historical data
+msft_prices = yf.download('MSFT', start='2023-01-01', end='2023-08-01', progress=False)['Adj Close']
+
+# Calculate estimated spread and log returns
+estimated_spread = msft_prices * 0.0003
+returns = np.log(msft_prices).diff().dropna()
+
+num_levels = 10
+
+# Fit GARCH model and extract volatility
+garch_fitted = arch_model(returns, vol='Garch', p=1, q=1).fit(disp="off")
+volatility = garch_fitted.conditional_volatility
+
+# Prepare price series and snapshots
+num_snapshots = len(volatility)
+price_series = msft_prices[-num_snapshots:].values + np.random.normal(0, volatility * 0.2, num_snapshots)
+
+# Dynamic spread model based on volatility and time of day
+def dynamic_spread_model(index, time_of_day_factor):
+    base_spread = estimated_spread[index]
+    spread = base_spread + (volatility[index] * 0.05) + (base_spread * time_of_day_factor)
+    return spread
+
+# Time-dependent intensity function for liquidity and volatility patterns
+def generate_time_dependent_intensity(timestamp):
+    return (np.sin(2 * np.pi * timestamp / (num_snapshots / 2)) + 1.1) * np.random.uniform(0.98, 1.02)
+
+# Generate bid and ask prices
+bid_prices = []
+ask_prices = []
+for i in range(num_snapshots):
+    time_of_day_factor = generate_time_dependent_intensity(i)
+    spread = dynamic_spread_model(i, time_of_day_factor)
+    
+    bid_base = price_series[i] - spread / 2
+    ask_base = price_series[i] + spread / 2
+    
+    bid_prices.append(np.sort(bid_base - np.random.uniform(0, 0.0002, num_levels))[::-1])
+    ask_prices.append(np.sort(ask_base + np.random.uniform(0, 0.0002, num_levels)))
+
+bid_prices = np.array(bid_prices)
+ask_prices = np.array(ask_prices)
+
+# Generate order sizes and inject random liquidity
+def generate_order_size():
+    return np.random.lognormal(mean=5.8, sigma=0.3)
+
+def inject_random_liquidity(volumes):
+    return volumes + np.random.lognormal(mean=4.8, sigma=0.3, size=volumes.shape)
+
+# Generate bid and ask volumes
+bid_volumes = np.array([inject_random_liquidity(np.random.poisson(lam=generate_order_size() * generate_time_dependent_intensity(i), size=num_levels)) for i in range(num_snapshots)])
+ask_volumes = np.array([inject_random_liquidity(np.random.poisson(lam=generate_order_size() * generate_time_dependent_intensity(i), size=num_levels)) for i in range(num_snapshots)])
+
+# Convert to DataFrames
+dfBidPrices = pd.DataFrame(bid_prices)
+dfAskPrices = pd.DataFrame(ask_prices)
+dfBidVolumes = pd.DataFrame(bid_volumes)
+dfAskVolumes = pd.DataFrame(ask_volumes)
+
+# Output data verification
+print("First few rows of dfBidPrices:\n", dfBidPrices.head())
+print("First few rows of dfAskPrices:\n", dfAskPrices.head())
+print("First few rows of dfBidVolumes:\n", dfBidVolumes.head())
+print("First few rows of dfAskVolumes:\n", dfAskVolumes.head())
+
+# Check for zeros and NaNs in data
+print("Number of zeros in dfBidPrices:", (dfBidPrices == 0).sum().sum())
+print("Number of zeros in dfAskPrices:", (dfAskPrices == 0).sum().sum())
+print("Number of zeros in dfBidVolumes:", (dfBidVolumes == 0).sum().sum())
+print("Number of zeros in dfAskVolumes:", (dfAskVolumes == 0).sum().sum())
+
+print("Number of NaNs in dfBidPrices:", dfBidPrices.isna().sum().sum())
+print("Number of NaNs in dfAskPrices:", dfAskPrices.isna().sum().sum())
+print("Number of NaNs in dfBidVolumes:", dfBidVolumes.isna().sum().sum())
+print("Number of NaNs in dfAskVolumes:", dfAskVolumes.isna().sum().sum())
+
+# Section 2: Order Matching and Execution
+
+class Tick:
+    def __init__(self, timestamp, qty, price, id_num, is_bid):
+        self.timestamp = timestamp
+        self.qty = qty
+        self.price = price
+        self.id_num = id_num
+        self.is_bid = is_bid
+        self.visible_qty = qty  # Initial visible quantity (for iceberg orders)
+
+class Trade(Tick):
+    pass  # Inherits directly from Tick
+
+class Ask(Tick):
+    def __init__(self, timestamp, qty, price, id_num):
+        super().__init__(timestamp, qty, price, id_num, is_bid=False)
+
+class Bid(Tick):
+    def __init__(self, timestamp, qty, price, id_num):
+        super().__init__(timestamp, qty, price, id_num, is_bid=True)
+
+class Order:
+    def __init__(self, tick, iceberg_qty=0):
+        self.tick = tick
+        self.iceberg_qty = iceberg_qty  # Hidden quantity in iceberg orders
+        self.next_order = None
+        self.prev_order = None
+
+class Limit:
+    def __init__(self, price):
+        self.price = price
+        self.size = 0
+        self.total_volume = 0
+        self.head_order = None
+        self.tail_order = None
+
+    def append_order(self, order):
+        if self.tail_order:
+            self.tail_order.next_order = order
+            order.prev_order = self.tail_order
+            self.tail_order = order
+        else:
+            self.head_order = self.tail_order = order
+        self.size += 1
+        self.total_volume += order.tick.visible_qty
+
+    def remove_order(self, order):
+        self.total_volume -= order.tick.visible_qty
+        self.size -= 1
+
+        if order.prev_order:
+            order.prev_order.next_order = order.next_order
+        if order.next_order:
+            order.next_order.prev_order = order.prev_order
+        if order == self.head_order:
+            self.head_order = order.next_order
+        if order == self.tail_order:
+            self.tail_order = order.prev_order
+
+        if self.size == 0:
+            self.head_order = self.tail_order = None
+
+class Tree:
+    def __init__(self):
+        self.price_tree = SortedDict()
+        self.volume = 0
+
+    def insert_order(self, order):
+        if order.tick.price not in self.price_tree:
+            self.price_tree[order.tick.price] = Limit(order.tick.price)
+        self.price_tree[order.tick.price].append_order(order)
+        self.volume += order.tick.visible_qty
+
+    def remove_order(self, order):
+        if order.tick.price in self.price_tree:
+            limit = self.price_tree[order.tick.price]
+            limit.remove_order(order)
+            if limit.size == 0:
+                del self.price_tree[order.tick.price]
+            self.volume -= order.tick.visible_qty
+
+    def match_order(self, incoming_order, max_iterations=1000, time_limit=2):
+        trades = []
+        iterations = 0
+        start_time = time.time()
+
+        while incoming_order.tick.visible_qty > 0 and iterations < max_iterations:
+            if time.time() - start_time > time_limit:
+                logging.warning(f"[TIMEOUT] Match order exceeded time limit of {time_limit} seconds.")
+                break
+
+            iterations += 1
+
+            # Ensure price_tree is not empty before accessing
+            if len(self.price_tree) > 0:
+                best_price = self.price_tree.peekitem(-1)[0] if incoming_order.tick.is_bid else self.price_tree.peekitem(0)[0]
+            else:
+                logging.warning(f"[MATCH] No {'asks' if incoming_order.tick.is_bid else 'bids'} to match with {'bid' if incoming_order.tick.is_bid else 'ask'} order at {incoming_order.tick.price}")
+                break
+
+            # Safeguard for minimal price differences
+            if abs(incoming_order.tick.price - best_price) < MIN_PRICE_DIFFERENCE:
+                logging.warning(f"[MIN PRICE DIFF] Skipping match due to minimal price difference: {abs(incoming_order.tick.price - best_price)}")
+                break
+
+            limit = self.price_tree[best_price]
+            head_order = limit.head_order
+
+            if not head_order:
+                logging.warning(f"[MATCH] No orders at price level {best_price}")
+                del self.price_tree[best_price]
+                break
+
+            trade_qty = min(incoming_order.tick.visible_qty, head_order.tick.visible_qty)
+            logging.info(f"[TRADE] Quantity: {trade_qty} | Price: {best_price}")
+
+            trade = Trade(incoming_order.tick.timestamp, trade_qty, best_price, 0, incoming_order.tick.is_bid)
+            trades.append(trade)
+
+            head_order.tick.visible_qty -= trade_qty
+            if head_order.tick.visible_qty == 0:
+                limit.remove_order(head_order)
+                if limit.size == 0:
+                    del self.price_tree[best_price]
+
+            incoming_order.tick.visible_qty -= trade_qty
+
+            if incoming_order.iceberg_qty > 0 and incoming_order.tick.visible_qty == 0:
+                additional_qty = min(incoming_order.iceberg_qty, trade_qty)
+                incoming_order.tick.visible_qty = additional_qty
+                incoming_order.iceberg_qty -= additional_qty
+
+            # Log incomplete matches
+            if incoming_order.tick.visible_qty > 0 and (limit.size == 0 or incoming_order.tick.visible_qty == 0):
+                logging.warning(f"[INCOMPLETE MATCH] Remaining qty {incoming_order.tick.visible_qty} could not be matched.")
+                break
+
+        if iterations >= max_iterations:
+            logging.warning(f"[MATCH WARNING] Max iterations reached for order {incoming_order.tick.id_num} at price {incoming_order.tick.price}")
+
+        logging.info(f"[MATCH COMPLETE] Total Trades: {len(trades)} | Remaining visible qty: {incoming_order.tick.visible_qty}")
+
+        return trades
+
+# Section 3: Order Book Operations
+
+MIN_PRICE_DIFFERENCE = 0.001  # Minimum price difference for a valid match
+
+class OrderBook:
+    def __init__(self, transaction_cost=0.0001):
+        self.trades = deque()
+        self.bids = Tree()
+        self.asks = Tree()
+        self.cumulative_cost = 0
+        self.slippage_list = []
+        self.execution_prices = []
+        self.cancellations = []
+        self.transaction_cost = transaction_cost
+        self.market_impact_factor = 0.00001
+        self.order_cancellation_prob = 0.03
+        self.liquidity_provider_interval = 10
+        self.latency_factor = 0.002
+
+    def apply_market_impact(self, order):
+        # Apply market impact based on order size relative to total volume
+        impact = self.market_impact_factor * np.sqrt(order.tick.qty / max(self.bids.volume, self.asks.volume, 1))
+        price_tree = self.asks.price_tree if order.tick.is_bid else self.bids.price_tree
+
+        for price in list(price_tree.keys()):
+            adjusted_price = price * (1 + impact) if order.tick.is_bid else price * (1 - impact)
+            price_tree[adjusted_price] = price_tree.pop(price)
+
+    def apply_temporary_and_permanent_impact(self, order, temp_impact_factor=0.05, perm_impact_factor=0.005):
+        # Apply both temporary and permanent market impacts
+        impact = lambda factor: factor * np.sqrt(order.tick.qty / max(self.bids.volume, self.asks.volume, 1))
+        self.apply_impact(order, impact(temp_impact_factor))
+        self.adjust_permanent_impact(order, impact(perm_impact_factor))
+
+    def apply_impact(self, order, impact):
+        price_tree = self.asks.price_tree if order.tick.is_bid else self.bids.price_tree
+        for price in list(price_tree.keys()):
+            adjusted_price = price * (1 + impact) if order.tick.is_bid else price * (1 - impact)
+            price_tree[adjusted_price] = price_tree.pop(price)
+
+    def adjust_permanent_impact(self, order, perm_impact):
+        # Adjust price tree permanently for impact
+        price_tree = self.asks.price_tree if order.tick.is_bid else self.bids.price_tree
+        for price in price_tree.keys():
+            price_tree[price] *= (1 + perm_impact) if order.tick.is_bid else (1 - perm_impact)
+
+    def calculate_dynamic_slippage(self, order, trade):
+        # Calculate slippage based on order size and market depth
+        depth_factor = (self.bids.volume + self.asks.volume) / 2
+        return (order.tick.qty / depth_factor) * abs(order.tick.price - trade.price) * 0.5
+
+    def calculate_dynamic_transaction_cost(self, order, trade):
+        # Calculate transaction cost based on order size and liquidity
+        liquidity_factor = max(self.bids.volume, self.asks.volume)
+        return self.transaction_cost * (1 + (order.tick.qty / liquidity_factor))
+
+    def split_order(self, tick, split_factor=10):
+        # Split large orders into smaller parts
+        split_qty = tick.qty // split_factor
+        remaining_qty = tick.qty
+        orders = []
+
+        while remaining_qty > 0:
+            current_qty = min(split_qty, remaining_qty)
+            remaining_qty -= current_qty
+            orders.append(Order(Tick(tick.timestamp, current_qty, tick.price, tick.id_num, tick.is_bid)))
+
+        return orders
+
+    def process_order(self, tick):
+        orders = self.split_order(tick) if tick.qty > 1000 else [Order(tick)]
+        
+        for order in orders:
+            print(f"Processing order: {order.tick.id_num}, {order.tick.qty} @ {order.tick.price}")
+            if random.random() < self.order_cancellation_prob:
+                print(f"Order {order.tick.id_num} cancelled.")
+                self.cancellations.append(order)
+                continue
+
+            time.sleep(random.uniform(0, self.latency_factor))  # Simulate latency
+            self.apply_market_impact(order)
+
+            matching_trades = self.asks.match_order(order) if order.tick.is_bid else self.bids.match_order(order)
+
+            if order.tick.visible_qty > 0:
+                (self.bids if order.tick.is_bid else self.asks).insert_order(order)
+            
+            self.trades.extend(matching_trades)
+            for trade in matching_trades:
+                slippage = self.calculate_dynamic_slippage(order, trade)
+                self.slippage_list.append(slippage)
+                self.cumulative_cost += (slippage + self.calculate_dynamic_transaction_cost(order, trade)) * trade.qty
+                self.execution_prices.append(trade.price)
+                print(f"Trade executed: {trade.qty} @ {trade.price:.4f}")
+            
+            if not matching_trades:
+                print(f"No match found for order: {order.tick.id_num}")
+
+    def simulate_liquidity_providers(self, timestamp):
+        if timestamp % self.liquidity_provider_interval == 0:
+            mid_price = self.get_mid_price()
+            if mid_price is None:
+                return
+
+            self.bid(timestamp, random.randint(2000, 3000), random.randint(1500, 3000), mid_price - 0.01)
+            self.ask(timestamp, random.randint(3000, 4000), random.randint(1500, 3000), mid_price + 0.01)
+            print(f"Liquidity provider injected bid: {mid_price:.4f} @ {mid_price - 0.01}, ask: {mid_price:.4f} @ {mid_price + 0.01}")
+
+    def bid(self, timestamp, id_num, qty, price):
+        self.process_order(Bid(timestamp, qty, price, id_num))
+
+    def ask(self, timestamp, id_num, qty, price):
+        self.process_order(Ask(timestamp, qty, price, id_num))
+
+    def get_mid_price(self):
+        best_bid = self.bids.price_tree.peekitem(-1)[0] if self.bids.price_tree else None
+        best_ask = self.asks.price_tree.peekitem(0)[0] if self.asks.price_tree else None
+        return (best_bid + best_ask) / 2 if best_bid and best_ask else None
+
+    def print_order_book(self):
+        print(self)  # Calls the __str__ method to print the order book contents
+
+    def __str__(self):
+        bid_str = "\n".join(f"Price: {price:.4f}, Volume: {self.bids.price_tree[price].total_volume}" for price in reversed(self.bids.price_tree.keys()))
+        ask_str = "\n".join(f"Price: {price:.4f}, Volume: {self.asks.price_tree[price].total_volume}" for price in self.asks.price_tree.keys())
+        trade_str = "\n".join(f"{trade.qty} @ {trade.price:.4f} ({trade.timestamp})" for trade in self.trades)
+        return f"------ Bids -------\n{bid_str}\n\n------ Asks -------\n{ask_str}\n\n------ Trades ------\n{trade_str}"
+
+    def numerical_output(self):
+        if not self.execution_prices:
+            print("No trades executed.")
+            return {}
+
+        average_slippage = np.mean(self.slippage_list)
+        total_execution_cost = self.cumulative_cost
+        min_execution_price = np.min(self.execution_prices)
+        max_execution_price = np.max(self.execution_prices)
+        mean_execution_price = np.mean(self.execution_prices)
+        total_orders_executed = len(self.execution_prices)
+        total_volume_executed = sum([trade.qty for trade in self.trades])
+
+        print("Numerical Output:")
+        print(f"Average Slippage: {average_slippage:.6f}")
+        print(f"Total Execution Cost (including transaction costs and slippage): {total_execution_cost:.2f}")
+        print(f"Min Execution Price: {min_execution_price:.4f}")
+        print(f"Max Execution Price: {max_execution_price:.4f}")
+        print(f"Mean Execution Price: {mean_execution_price:.4f}")
+        print(f"Total Orders Executed: {total_orders_executed}")
+        print(f"Total Volume Executed: {total_volume_executed}")
+        print(f"Total Trades: {len(self.trades)}")
+        print(f"Final Bid Volume: {self.bids.volume}")
+        print(f"Final Ask Volume: {self.asks.volume}")
+
+        return {
+            "average_slippage": average_slippage,
+            "total_execution_cost": total_execution_cost,
+            "min_execution_price": min_execution_price,
+            "max_execution_price": max_execution_price,
+            "mean_execution_price": mean_execution_price,
+            "total_orders_executed": total_orders_executed,
+            "total_volume_executed": total_volume_executed,
+            "final_bid_volume": self.bids.volume,
+            "final_ask_volume": self.asks.volume,
+            "total_trades": len(self.trades)
+        }
+
+# Section 4: Order Simulation
+
+def simulate_orders_batch(args):
+    order_book, batch = args
+    start_time = time.time()
+
+    try:
+        for idx, (timestamp, order_id, ask_price, ask_volume, bid_price, bid_volume) in enumerate(batch):
+            if ask_price > 0 and ask_volume > 0:
+                trades = order_book.ask(timestamp, order_id, ask_volume, ask_price)
+                order_id += 1
+                if not trades:
+                    logging.warning(f"[WARNING] No trades for ask order {order_id} at price {ask_price:.4f}")
+
+            if bid_price > 0 and bid_volume > 0:
+                trades = order_book.bid(timestamp, order_id, bid_volume, bid_price)
+                order_id += 1
+                if not trades:
+                    logging.warning(f"[WARNING] No trades for bid order {order_id} at price {bid_price:.4f}")
+
+            logging.debug(f"[ORDER] {idx + 1} in batch processed in {time.time() - start_time:.4f} seconds")
+
+        logging.info(f"[BATCH] Processed in {time.time() - start_time:.2f} seconds | Total trades: {len(order_book.trades)}")
+        
+    except MemoryError as e:
+        logging.critical(f"MemoryError during batch processing: {e}")
+        raise
+    except Exception as e:
+        logging.error(f"Unhandled exception: {e}", exc_info=True)
+        raise
+
+    return len(order_book.trades)
+
+def simulate_orders_from_dataframe(order_book, dfPrices, dfVolumes, batch_size=5):
+    timestamp = 1000
+    order_id = 1
+    batches = []
+
+    logging.info("Starting order simulation...")
+
+    for index, row in dfPrices.iterrows():
+        ask_prices = row[num_levels:]
+        bid_prices = row[:num_levels][::-1]
+        ask_volumes = dfVolumes.iloc[index, num_levels:].astype(int)
+        bid_volumes = dfVolumes.iloc[index, :num_levels][::-1].astype(int)
+
+        batch = [(timestamp, order_id, ask_price, ask_volume, bid_price, bid_volume)
+                 for ask_price, ask_volume, bid_price, bid_volume in zip(ask_prices, ask_volumes, bid_prices, bid_volumes)]
+        
+        while len(batch) >= batch_size:
+            batches.append((order_book, batch[:batch_size]))
+            batch = batch[batch_size:]
+        
+        if batch:
+            batches.append((order_book, batch))
+
+        timestamp += 1
+
+    results = []
+    try:
+        for batch in batches:
+            results.append(simulate_orders_batch(batch))
+    except Exception as e:
+        logging.error(f"Exception during batch processing: {e}", exc_info=True)
+
+    logging.info("Order simulation completed.")
+    return results
+
+# Section 5: Run Simulation
+if __name__ == '__main__':
+    tracemalloc.start()  # Start memory profiling
+    logging.info("[START] Initializing the order book and starting simulation...")
+    order_book = OrderBook(transaction_cost=0.0001)
+
+    try:
+        # Combine bid and ask data for simulation
+        combined_prices = pd.concat([dfBidPrices, dfAskPrices], axis=1)
+        combined_volumes = pd.concat([dfBidVolumes, dfAskVolumes], axis=1)
+        
+        # Run simulation
+        results = simulate_orders_from_dataframe(order_book, combined_prices, combined_volumes)
+        
+        if not results:
+            logging.warning("[WARNING] No trades were executed. Check order processing.")
+        
+        # Output results
+        logging.info("[COMPLETE] Simulation completed. Analyzing order book...")
+        order_book.print_order_book()
+
+        logging.info("[SUMMARY] Calculating and printing numerical summary...")
+        order_book.numerical_output()
+
+    except Exception as e:
+        logging.error(f"Critical failure during simulation: {e}", exc_info=True)
+    finally:
+        tracemalloc.stop()  # Stop memory profiling
