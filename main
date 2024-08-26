@@ -1,0 +1,741 @@
+# Install necessary packages
+%pip install arch --upgrade
+%pip install pathos
+%pip install yfinance
+%pip install sortedcontainers
+
+# Import necessary modules
+import sys
+import logging
+import psutil
+from pathos.multiprocessing import ProcessingPool as Pool
+import numpy as np
+import pandas as pd
+from collections import deque
+import time
+from sortedcontainers import SortedDict
+import random
+from arch import arch_model
+import threading
+import tracemalloc
+import gc
+import yfinance as yf
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
+
+# Define thresholds for system resource monitoring
+MAX_CPU_PERCENT = 80
+MAX_MEMORY_PERCENT = 80
+CHECK_INTERVAL = 1  # Check every second
+
+def monitor_resources():
+    while True:
+        cpu_percent = psutil.cpu_percent(interval=1)
+        memory_percent = psutil.virtual_memory().percent
+        
+        if cpu_percent > MAX_CPU_PERCENT:
+            logging.warning(f"High CPU usage: {cpu_percent}%. Pausing execution.")
+            time.sleep(2)  # Pause to reduce CPU load
+
+        if memory_percent > MAX_MEMORY_PERCENT:
+            logging.warning(f"High Memory usage: {memory_percent}%. Collecting garbage.")
+            gc.collect()  # Free up memory
+            time.sleep(2)  # Pause to reduce memory load
+
+        time.sleep(CHECK_INTERVAL)
+
+# Start monitoring system resources in a separate thread
+monitor_thread = threading.Thread(target=monitor_resources, daemon=True)
+monitor_thread.start()
+
+gpu_info = !nvidia-smi
+gpu_info = '\n'.join(gpu_info)
+if gpu_info.find('failed') >= 0:
+  print('Not connected to a GPU')
+else:
+  print(gpu_info)
+
+from psutil import virtual_memory
+ram_gb = virtual_memory().total / 1e9
+print('Your runtime has {:.1f} gigabytes of available RAM\n'.format(ram_gb))
+
+if ram_gb < 20:
+  print('Not using a high-RAM runtime')
+else:
+  print('You are using a high-RAM runtime!')
+
+  # Section 1: Setup and Spread Calibration with Adjustments
+
+# Fetch and prepare intraday data for MSFT (60-minute intervals)
+msft_data = yf.download('MSFT', start='2023-08-01', end='2023-08-31', interval='60m', progress=False).dropna(subset=['Adj Close', 'Volume'])
+
+# Calculate percentage returns for GARCH model calibration
+returns = msft_data['Adj Close'].pct_change().dropna()
+
+# Fit a GARCH(1,1) model to the intraday returns
+garch_fitted = arch_model(returns * 100, vol='Garch', p=1, q=1, dist='normal').fit(disp='off')
+volatility = garch_fitted.conditional_volatility / 100  # Convert back to original scale
+
+# Align data and calculate the spread
+aligned_data = pd.concat([msft_data['Adj Close'], msft_data['Volume'], volatility], axis=1).dropna()
+aligned_data.columns = ['Adj Close', 'Volume', 'Volatility']
+aligned_data['Spread'] = aligned_data['Adj Close'] * 0.001 * (1 + aligned_data['Volatility'] * 0.5)
+
+# Define and apply time-of-day spread adjustment
+def time_of_day_spread_adjustment(index):
+    time_fraction = (index % 390) / 390
+    return 1 + 0.2 * np.sin(2 * np.pi * time_fraction - np.pi / 2)
+
+aligned_data['Spread'] *= [time_of_day_spread_adjustment(i) for i in range(len(aligned_data))]
+
+# Generate mid prices with adjusted noise factor
+np.random.seed(42)
+aligned_data['Mid_Price'] = aligned_data['Adj Close'] + np.random.normal(
+    0, aligned_data['Volatility'] * aligned_data['Adj Close'] * 0.3
+).clip(min=0)  # Prevent negative prices
+
+# Generate bid and ask prices across multiple levels
+num_levels = 10
+level_multipliers = 1 + np.arange(num_levels) / num_levels * 0.3
+
+bid_prices = aligned_data['Mid_Price'].values[:, None] - aligned_data['Spread'].values[:, None] * level_multipliers / 2
+ask_prices = aligned_data['Mid_Price'].values[:, None] + aligned_data['Spread'].values[:, None] * level_multipliers / 2
+
+# Define and apply time-of-day liquidity adjustment
+def time_of_day_liquidity_adjustment(index):
+    time_fraction = (index % 390) / 390
+    return 1 + 0.25 * np.cos(2 * np.pi * time_fraction)
+
+liquidity_adjustments = np.array([time_of_day_liquidity_adjustment(i) for i in range(len(aligned_data))])
+level_decay = np.exp(-np.arange(num_levels) / 6)
+
+# Generate bid and ask volumes
+base_volume = aligned_data['Volume'].values / 50
+bid_volumes = base_volume[:, None] * liquidity_adjustments[:, None] * level_decay * np.random.uniform(0.98, 1.02, (len(aligned_data), num_levels))
+ask_volumes = bid_volumes.copy()
+
+# Create DataFrames for bid and ask prices and volumes
+df_bid_prices = pd.DataFrame(bid_prices, columns=[f'Bid_Price_{i+1}' for i in range(num_levels)])
+df_ask_prices = pd.DataFrame(ask_prices, columns=[f'Ask_Price_{i+1}' for i in range(num_levels)])
+df_bid_volumes = pd.DataFrame(bid_volumes, columns=[f'Bid_Volume_{i+1}' for i in range(num_levels)])
+df_ask_volumes = pd.DataFrame(ask_volumes, columns=[f'Ask_Volume_{i+1}' for i in range(num_levels)])
+
+# Combine the bid and ask prices and volumes into a single DataFrame
+dfPrices = pd.concat([df_bid_prices.iloc[:, ::-1], df_ask_prices], axis=1)
+dfVolumes = pd.concat([df_bid_volumes.iloc[:, ::-1], df_ask_volumes], axis=1)
+order_book = pd.concat([aligned_data[['Mid_Price', 'Spread']], df_bid_prices, df_ask_prices, df_bid_volumes, df_ask_volumes], axis=1)
+
+# Calculate VWAP and TWAP
+order_book['Cumulative_Volume'] = aligned_data['Volume'].cumsum()
+order_book['Cumulative_Turnover'] = (aligned_data['Mid_Price'] * aligned_data['Volume']).cumsum()
+order_book['VWAP'] = order_book['Cumulative_Turnover'] / order_book['Cumulative_Volume']
+order_book['TWAP'] = order_book['Mid_Price'].rolling(window=3, min_periods=1).mean()
+
+# Validation checks to ensure no negative or zero prices and volumes
+assert (order_book.filter(like='Price') <= 0).sum().sum() == 0, "Negative or zero prices found."
+assert (order_book.filter(like='Volume') < 0).sum().sum() == 0, "Negative volumes found."
+
+# Rename aligned_data to msft_prices and calculate VWAP and TWAP
+msft_prices = aligned_data.copy()
+msft_prices['Cumulative_Volume'] = msft_prices['Volume'].cumsum()
+msft_prices['Cumulative_Turnover'] = (msft_prices['Mid_Price'] * msft_prices['Volume']).cumsum()
+msft_prices['vwap'] = msft_prices['Cumulative_Turnover'] / msft_prices['Cumulative_Volume']
+msft_prices['twap'] = msft_prices['Mid_Price'].rolling(window=3, min_periods=1).mean()
+
+# Ensure no NaNs in VWAP and TWAP columns
+msft_prices['vwap'].fillna(method='ffill', inplace=True)
+msft_prices['twap'].fillna(method='ffill', inplace=True)
+
+# Summary statistics
+order_book_summary = msft_prices.describe().transpose()
+order_book_summary
+
+# Section 2: Order Matching Engine
+
+# Configure logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s', handlers=[
+    logging.FileHandler("order_matching.log"),
+    logging.StreamHandler()
+])
+
+# Class representing a market tick (order)
+class Tick:
+    def __init__(self, timestamp, qty, price, id_num, is_bid):
+        self.timestamp = timestamp
+        self.qty = qty
+        self.price = price
+        self.id_num = id_num
+        self.is_bid = is_bid
+        self.visible_qty = qty  # Used for iceberg orders or partial fills
+
+# Class representing a trade
+class Trade(Tick):
+    pass
+
+# Specific classes for bids and asks
+class Ask(Tick):
+    def __init__(self, timestamp, qty, price, id_num):
+        super().__init__(timestamp, qty, price, id_num, is_bid=False)
+
+class Bid(Tick):
+    def __init__(self, timestamp, qty, price, id_num):
+        super().__init__(timestamp, qty, price, id_num, is_bid=True)
+
+# Class representing an order in the order book
+class Order:
+    def __init__(self, tick, iceberg_qty=0):
+        self.tick = tick
+        self.iceberg_qty = iceberg_qty
+        self.next_order = None
+        self.prev_order = None
+
+# Class representing a price level in the order book
+class Limit:
+    def __init__(self, price):
+        self.price = price
+        self.size = 0
+        self.total_volume = 0
+        self.head_order = None
+        self.tail_order = None
+
+    def append_order(self, order):
+        if self.tail_order:
+            order.prev_order = self.tail_order
+            self.tail_order.next_order = order
+            self.tail_order = order
+        else:
+            self.head_order = self.tail_order = order
+        self.size += 1
+        self.total_volume += order.tick.visible_qty
+
+    def remove_order(self, order):
+        self.total_volume -= order.tick.visible_qty
+        self.size -= 1
+        if order.prev_order:
+            order.prev_order.next_order = order.next_order
+        if order.next_order:
+            order.next_order.prev_order = order.prev_order
+        if order == self.head_order:
+            self.head_order = order.next_order
+        if order == self.tail_order:
+            self.tail_order = order.prev_order
+        if self.size == 0:
+            self.head_order = self.tail_order = None
+            return True
+        return False
+
+# Class representing the order book (bid or ask side)
+class Tree:
+    def __init__(self, is_bid):
+        self.price_tree = SortedDict()
+        self.volume = 0
+        self.is_bid = is_bid
+
+    def insert_order(self, order):
+        logging.debug(f"Inserting order: {order.tick.id_num}, {order.tick.qty} @ {order.tick.price}")
+        assert order.tick.price >= 0, f"Order price is invalid: {order.tick.price}"
+        limit = self.price_tree.setdefault(order.tick.price, Limit(order.tick.price))
+        limit.append_order(order)
+        self.volume += order.tick.visible_qty
+
+    def remove_order(self, order):
+        if order.tick.price in self.price_tree:
+            limit = self.price_tree[order.tick.price]
+            if limit.remove_order(order) and limit.size == 0:
+                del self.price_tree[order.tick.price]
+            self.volume -= order.tick.visible_qty
+
+    def match_order(self, incoming_order, opposing_tree, min_order_size=1):
+        trades = []
+        best_price = None 
+        try:
+            while incoming_order.tick.visible_qty >= min_order_size:
+                if not opposing_tree.price_tree:
+                    logging.info("No matching orders available in the opposing book.")
+                    break
+
+                best_price = opposing_tree.price_tree.peekitem(0)[0] if incoming_order.tick.is_bid else opposing_tree.price_tree.peekitem(-1)[0]
+
+                if (incoming_order.tick.is_bid and incoming_order.tick.price < best_price) or \
+                  (not incoming_order.tick.is_bid and incoming_order.tick.price > best_price):
+                    logging.info("Incoming order price does not match with the best price in the book.")
+                    break
+
+                limit = opposing_tree.price_tree[best_price]
+                head_order = limit.head_order
+                trade_qty = min(incoming_order.tick.visible_qty, head_order.tick.visible_qty)
+                if trade_qty < min_order_size:
+                    logging.info(f"Trade quantity {trade_qty} is below the minimum order size {min_order_size}. Skipping.")
+                    break
+
+                trade = Trade(incoming_order.tick.timestamp, trade_qty, best_price, 0, incoming_order.tick.is_bid)
+                trades.append(trade)
+                logging.info(f"Trade executed: {trade.qty} shares at {trade.price} (Timestamp: {trade.timestamp})")
+
+                incoming_order.tick.visible_qty -= trade_qty
+                head_order.tick.visible_qty -= trade_qty
+
+                if head_order.tick.visible_qty < min_order_size:
+                    limit.remove_order(head_order)
+                    if limit.size == 0:
+                        del opposing_tree.price_tree[best_price]
+
+            if not trades:
+                logging.warning(f"No trades executed for order {incoming_order.tick.id_num} at price {incoming_order.tick.price:.4f}. "
+                                f"Best price in the book: {best_price if best_price is not None else 'N/A'}, Remaining volume: {incoming_order.tick.visible_qty}")
+
+            elif incoming_order.tick.visible_qty >= min_order_size:
+                logging.info(f"Order {incoming_order.tick.id_num} partially matched. Remaining quantity: {incoming_order.tick.visible_qty}")
+                self.insert_order(incoming_order)
+
+        except Exception as e:
+            logging.error(f"Exception during order matching: {e}")
+
+        return trades
+
+        # Section 3: Order Simulation
+
+# Configure logging
+logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(message)s', handlers=[
+    logging.FileHandler("order_matching.log"),
+    logging.StreamHandler()
+])
+
+# Detect outliers in a series based on the threshold
+def detect_outliers(series, threshold=3):
+    return (series - series.mean()).abs() > (threshold * series.std())
+
+# Simulate order processing for a batch of orders
+def simulate_orders_batch(args):
+    order_book, batch = args
+    start_time = time.time()
+    try:
+        for idx, (timestamp, order_id, ask_price, ask_volume, bid_price, bid_volume) in enumerate(batch):
+            if ask_price > 0 and ask_volume > 0:
+                logging.debug(f"[ASK] Processing ask order {order_id} | Batch {timestamp} | Volume: {ask_volume} | Price: {ask_price}")
+                trades = order_book.ask(timestamp, order_id, ask_volume, ask_price)
+                order_id += 1
+                if not trades:
+                    logging.warning(f"No trades executed for ask order {order_id} at price {ask_price:.4f}")
+
+            if bid_price > 0 and bid_volume > 0:
+                logging.debug(f"[BID] Processing bid order {order_id} | Batch {timestamp} | Volume: {bid_volume} | Price: {bid_price}")
+                trades = order_book.bid(timestamp, order_id, bid_volume, bid_price)
+                order_id += 1
+                if not trades:
+                    logging.warning(f"No trades executed for bid order {order_id} at price {bid_price:.4f}")
+
+            logging.debug(f"Order {idx + 1} in batch processed in {time.time() - start_time:.4f} seconds")
+
+        logging.info(f"Batch processed in {time.time() - start_time:.2f} seconds | Total trades executed: {len(order_book.trades)}")
+
+    except MemoryError as e:
+        logging.critical(f"MemoryError during batch processing: {e}")
+        raise
+    except Exception as e:
+        logging.error(f"Unhandled exception during batch processing: {e}", exc_info=True)
+        raise
+    finally:
+        logging.info("Batch processing completed.")
+    
+    return len(order_book.trades)
+
+# Simulate orders from DataFrame, batching for efficiency
+def simulate_orders_from_dataframe(order_book, dfPrices, dfVolumes, batch_size=None):
+    if batch_size is None:
+        batch_size = max(1, len(dfPrices) // 10)
+
+    timestamp, order_id = 1000, 1
+    batches = []
+
+    logging.info("Starting order simulation...")
+
+    for index, row in dfPrices.iterrows():
+        ask_prices, bid_prices = row[num_levels:], row[:num_levels][::-1]
+        ask_volumes, bid_volumes = dfVolumes.iloc[index, num_levels:], dfVolumes.iloc[index, :num_levels][::-1]
+
+        batch = [
+            (timestamp, order_id, ask_price, int(ask_volume), bid_price, int(bid_volume))
+            for ask_price, ask_volume, bid_price, bid_volume in zip(ask_prices, ask_volumes, bid_prices, bid_volumes)
+            if int(ask_volume) >= MIN_ORDER_SIZE and int(bid_volume) >= MIN_ORDER_SIZE
+        ]
+
+        if batch:
+            logging.debug(f"Batch {len(batches) + 1}: {len(batch)} orders added")
+            batches.append((order_book, batch))
+
+        timestamp += 1
+
+    try:
+        with Pool() as pool:
+            results = pool.map(simulate_orders_batch, batches)
+    except Exception as e:
+        logging.error(f"Exception during batch processing: {e}", exc_info=True)
+
+    logging.info("Order simulation completed.")
+    return results
+
+# Detect and log potential outliers in price or volume data
+outlier_count = dfPrices.apply(detect_outliers).sum().sum() + dfVolumes.apply(detect_outliers).sum().sum()
+if outlier_count > 0:
+    logging.warning(f"Detected {outlier_count} potential outliers in price or volume data.")
+
+# Ensure no NaNs in VWAP and TWAP columns
+msft_prices['vwap'].fillna(method='ffill', inplace=True)
+msft_prices['twap'].fillna(method='ffill', inplace=True)
+
+# Output NaN counts for validation
+print("NaNs in VWAP:", msft_prices['vwap'].isna().sum())
+print("NaNs in TWAP:", msft_prices['twap'].isna().sum())
+
+# Execute VWAP Strategy
+def execute_vwap_strategy(order_book, msft_prices, dfVolumes, total_order_value=20, price_flexibility=0.10):
+    total_shares_to_buy = total_order_value / msft_prices['Adj Close'].iloc[-1]
+    remaining_shares, match_count = total_shares_to_buy, 0
+
+    for i in range(len(msft_prices)):
+        target_price = msft_prices['vwap'].iloc[i]
+        available_volume = dfVolumes.iloc[i, :].sum()
+        order_size = min(remaining_shares, available_volume)
+
+        if order_size > 0:
+            adjusted_price = target_price * (1 + random.uniform(-price_flexibility, price_flexibility))
+            adjusted_price = max(min(adjusted_price, target_price * 1.01), target_price * 0.99)
+
+            logging.info(f"Attempting to execute {order_size} shares at VWAP {adjusted_price:.2f}")
+            trades = order_book.bid(msft_prices.index[i], i, order_size, adjusted_price)
+
+            if trades:
+                match_count += 1
+            remaining_shares -= order_size
+
+            if remaining_shares <= 0:
+                logging.info("Shares fully executed.")
+                break
+
+    logging.info(f"Total shares executed: {total_shares_to_buy - remaining_shares}")
+    logging.info(f"Number of successful matches: {match_count}")
+    if match_count == 0:
+        logging.warning("No trades were matched. Consider increasing price flexibility or participation rate.")
+
+# Execute TWAP Strategy
+def execute_twap_strategy(order_book, msft_prices, dfVolumes, total_order_value=20000, time_period=20, price_flexibility=0.10):
+    total_shares_to_buy = total_order_value / msft_prices['Adj Close'].iloc[-1]
+    shares_per_interval = total_shares_to_buy / (len(msft_prices) // time_period)
+    remaining_shares, match_count = total_shares_to_buy, 0
+
+    for i in range(0, len(msft_prices), time_period):
+        target_price = msft_prices['twap'].iloc[i]
+        available_volume = dfVolumes.iloc[i, :].sum()
+        order_size = min(shares_per_interval, remaining_shares, available_volume)
+
+        if order_size > 0:
+            adjusted_price = target_price * (1 + random.uniform(-price_flexibility, price_flexibility))
+            adjusted_price = max(min(adjusted_price, target_price * 1.01), target_price * 0.99)
+
+            logging.info(f"Attempting to execute {order_size} shares at TWAP {adjusted_price:.2f}")
+            trades = order_book.bid(msft_prices.index[i], i, order_size, adjusted_price)
+
+            if trades:
+                match_count += 1
+            remaining_shares -= order_size
+
+            if remaining_shares <= 0:
+                break
+
+    logging.info(f"Total shares executed: {total_shares_to_buy - remaining_shares}")
+    logging.info(f"Number of successful matches: {match_count}")
+    if match_count == 0:
+        logging.warning("No trades were matched. Consider increasing price flexibility or participation rate.")
+
+        # Section 4: Order Book Operations
+
+MIN_PRICE_DIFFERENCE = 0.001  # Minimum difference between prices for valid match
+MIN_ORDER_SIZE = 0.5  # Minimum order size
+
+class OrderBook:
+    def __init__(self, transaction_cost=0.0001):
+        self.trades = deque()
+        self.bids = Tree(is_bid=True)
+        self.asks = Tree(is_bid=False)
+        self.last_timestamp = 0
+        self.cumulative_cost = 0
+        self.slippage_list = []
+        self.execution_prices = []
+        self.transaction_cost = transaction_cost
+        self.market_impact_factor = 0.00001
+        self.order_cancellation_prob = 0.03
+        self.liquidity_provider_interval = 10
+        self.latency_factor = 0.002
+        self.cancellations = []
+
+    def apply_market_impact(self, order):
+        impact = min(0.005, self.market_impact_factor * np.sqrt(order.tick.qty / (self.bids.volume + self.asks.volume + 1)))
+
+        if order.tick.is_bid:
+            self._adjust_prices(self.asks.price_tree, 1 + impact)
+        else:
+            self._adjust_prices(self.bids.price_tree, 1 - impact)
+
+    def _adjust_prices(self, price_tree, adjustment_factor):
+        adjusted_prices = {price * adjustment_factor: limit for price, limit in price_tree.items()}
+        price_tree.clear()
+        price_tree.update(adjusted_prices)
+
+    def apply_temporary_and_permanent_impact(self, order, temporary_impact_factor=None, permanent_impact_factor=None):
+        temporary_impact_factor = temporary_impact_factor or 0.05 * np.random.uniform(0.8, 1.2)
+        permanent_impact_factor = permanent_impact_factor or 0.005 * np.random.uniform(0.8, 1.2)
+
+        temporary_impact = min(0.01, temporary_impact_factor * np.sqrt(order.tick.qty / max(self.bids.volume, self.asks.volume, 1)))
+        permanent_impact = min(0.005, permanent_impact_factor * np.sqrt(order.tick.qty / max(self.bids.volume, self.asks.volume, 1)))
+
+        if order.tick.is_bid:
+            self._adjust_prices(self.asks.price_tree, 1 + temporary_impact)
+        else:
+            self._adjust_prices(self.bids.price_tree, 1 - temporary_impact)
+
+        self._apply_permanent_impact(order, permanent_impact)
+
+    def _apply_permanent_impact(self, order, permanent_impact):
+        if order.tick.is_bid:
+            self._adjust_prices(self.asks.price_tree, 1 + permanent_impact)
+        else:
+            self._adjust_prices(self.bids.price_tree, 1 - permanent_impact)
+
+    def calculate_dynamic_slippage(self, order, trade):
+        market_depth_factor = (self.bids.volume + self.asks.volume) / 2
+        order_size_factor = order.tick.qty / market_depth_factor
+        spread = abs(order.tick.price - trade.price)
+        slippage = min(0.02 * trade.price, order_size_factor * spread * 0.5)
+
+        logging.debug(f"Calculated slippage: {slippage:.6f} for trade at price {trade.price}")
+        return slippage
+
+    def calculate_dynamic_transaction_cost(self, order, trade):
+        liquidity_factor = max(self.bids.volume, self.asks.volume)
+        return self.transaction_cost * (1 + (order.tick.qty / liquidity_factor))
+
+    def split_order(self, tick, split_factor=10):
+        adjusted_split_factor = max(1, int(split_factor * np.random.uniform(0.9, 1.1)))
+        split_qty = tick.qty // adjusted_split_factor
+        remaining_qty = tick.qty
+        orders = []
+
+        while remaining_qty > 0:
+            current_qty = min(split_qty, remaining_qty)
+            remaining_qty -= current_qty
+            orders.append(Order(Tick(tick.timestamp, current_qty, tick.price, tick.id_num, tick.is_bid)))
+
+        return orders
+
+    def process_order(self, tick):
+        split_factor = max(5, min(20, tick.qty // 1000))
+        orders = self.split_order(tick, split_factor)
+
+        for order in orders:
+            if order.tick.qty < MIN_ORDER_SIZE:
+                logging.warning(f"Skipping order {order.tick.id_num} with size {order.tick.qty} as it's too small to execute.")
+                continue
+
+            logging.info(f"Processing order: {order.tick.id_num}, {order.tick.qty} @ {order.tick.price:.4f}")
+
+            self.apply_market_impact(order)
+
+            matching_trades = self._match_and_insert_order(order)
+
+            for trade in matching_trades:
+                slippage = self.calculate_dynamic_slippage(order, trade)
+                transaction_cost = self.calculate_dynamic_transaction_cost(order, trade)
+                self.slippage_list.append(slippage)
+                self.cumulative_cost += (slippage + transaction_cost) * trade.qty
+                self.execution_prices.append(trade.price)
+
+                logging.info(f"Trade executed: {trade.qty} @ {trade.price:.4f}, Slippage: {slippage:.4f}, Transaction Cost: {transaction_cost:.4f}")
+
+            if not matching_trades:
+                logging.info(f"No match found for order: {order.tick.id_num}")
+
+            self.verify_order_book_state()
+
+    def _match_and_insert_order(self, order):
+        if order.tick.is_bid:
+            matching_trades = self.bids.match_order(order, self.asks)
+            if order.tick.visible_qty > 0:
+                self.bids.insert_order(order)
+        else:
+            matching_trades = self.asks.match_order(order, self.bids)
+            if order.tick.visible_qty > 0:
+                self.asks.insert_order(order)
+        return matching_trades
+
+    def verify_order_book_state(self):
+        for price, limit in self.bids.price_tree.items():
+            assert limit.total_volume > 0, f"Invalid state: Bid price level {price} has zero volume."
+        for price, limit in self.asks.price_tree.items():
+            assert limit.total_volume > 0, f"Invalid state: Ask price level {price} has zero volume."
+        logging.info("Order book state verified.")
+
+    def simulate_liquidity_providers(self, timestamp):
+        if timestamp % self.liquidity_provider_interval == 0:
+            mid_price = self.get_mid_price()
+            if mid_price is None:
+                return
+
+            lp_bid_qty = random.randint(1500, 3000)
+            lp_ask_qty = random.randint(1500, 3000)
+            lp_bid_price = mid_price - random.uniform(0.002, 0.008)
+            lp_ask_price = mid_price + random.uniform(0.002, 0.008)
+
+            if not (self.bids.price_tree and lp_bid_price <= self.bids.price_tree.peekitem(-1)[0]):
+                self.bid(timestamp, random.randint(2000, 3000), lp_bid_qty, lp_bid_price)
+            if not (self.asks.price_tree and lp_ask_price >= self.asks.price_tree.peekitem(0)[0]):
+                self.ask(timestamp, random.randint(3000, 4000), lp_ask_qty, lp_ask_price)
+
+            logging.info(f"Liquidity provider injected bid: {lp_bid_qty} @ {lp_bid_price:.4f}, ask: {lp_ask_qty} @ {lp_ask_price:.4f}")
+
+    def bid(self, timestamp, id_num, qty, price):
+        return self.process_order(Bid(timestamp=timestamp, qty=qty, price=price, id_num=id_num))
+
+    def ask(self, timestamp, id_num, qty, price):
+        return self.process_order(Ask(timestamp=timestamp, qty=qty, price=price, id_num=id_num))
+
+    def get_mid_price(self):
+        best_bid = self.bids.price_tree.peekitem(-1)[0] if len(self.bids.price_tree) > 0 else None
+        best_ask = self.asks.price_tree.peekitem(0)[0] if len(self.asks.price_tree) > 0 else None
+
+        return (best_bid + best_ask) / 2 if best_bid is not None and best_ask is not None else None
+
+    def print_order_book(self):
+        print(self)
+
+    def __str__(self):
+        result = "------ Bids -------\n"
+        for price in reversed(self.bids.price_tree.keys()):
+            result += f"Price: {price:.4f}, Volume: {self.bids.price_tree[price].total_volume}\n"
+        result += "\n------ Asks -------\n"
+        for price in self.asks.price_tree.keys():
+            result += f"Price: {price:.4f}, Volume: {self.asks.price_tree[price].total_volume}\n"
+        result += "\n------ Trades ------\n"
+        for trade in self.trades:
+            result += f"{trade.qty} @ {trade.price:.4f} ({trade.timestamp})\n"
+        return result
+
+    def numerical_output(self):
+        if not self.execution_prices:
+            logging.info("No trades executed.")
+            return self._empty_output()
+
+        average_slippage = np.mean(self.slippage_list) if self.slippage_list else 0
+        total_execution_cost = self.cumulative_cost
+        min_execution_price = np.min(self.execution_prices) if self.execution_prices else None
+        max_execution_price = np.max(self.execution_prices) if self.execution_prices else None
+        mean_execution_price = np.mean(self.execution_prices) if self.execution_prices else None
+        total_orders_executed = len(self.execution_prices)
+        total_volume_executed = sum(trade.qty for trade in self.trades)
+
+        logging.info("Numerical Output Summary:")
+        logging.info(f"Average Slippage: {average_slippage:.6f}")
+        logging.info(f"Total Execution Cost: {total_execution_cost:.2f}")
+        logging.info(f"Min Execution Price: {min_execution_price:.4f}")
+        logging.info(f"Max Execution Price: {max_execution_price:.4f}")
+        logging.info(f"Mean Execution Price: {mean_execution_price:.4f}")
+        logging.info(f"Total Orders Executed: {total_orders_executed}")
+        logging.info(f"Total Volume Executed: {total_volume_executed}")
+        logging.info(f"Final Bid Volume: {self.bids.volume}")
+        logging.info(f"Final Ask Volume: {self.asks.volume}")
+
+        return {
+            "average_slippage": average_slippage,
+            "total_execution_cost": total_execution_cost,
+            "min_execution_price": min_execution_price,
+            "max_execution_price": max_execution_price,
+            "mean_execution_price": mean_execution_price,
+            "total_orders_executed": total_orders_executed,
+            "total_volume_executed": total_volume_executed,
+            "final_bid_volume": self.bids.volume,
+            "final_ask_volume": self.asks.volume,
+            "total_trades": len(self.trades)
+        }
+
+    def _empty_output(self):
+        return {
+            "average_slippage": 0,
+            "total_execution_cost": 0,
+            "min_execution_price": None,
+            "max_execution_price": None,
+            "mean_execution_price": None,
+            "total_orders_executed": 0,
+            "total_volume_executed": 0,
+            "final_bid_volume": self.bids.volume,
+            "final_ask_volume": self.asks.volume,
+            "total_trades": 0
+        }
+
+# Section 5: Run the simulation
+def inject_initial_liquidity(order_book, levels=10, base_qty=20000, price_range=5):
+    mid_price = order_book.get_mid_price() or 250  # Default mid price if none exists
+    for i in range(1, levels + 1):
+        price_offset = i * price_range / levels
+        # Injecting both bids and asks
+        order_book.bid(1000 + i, i, base_qty * i, mid_price - price_offset)
+        order_book.ask(2000 + i, i, base_qty * i, mid_price + price_offset)
+
+# Initialize and inject liquidity into the VWAP and TWAP order books
+inject_initial_liquidity(order_book_vwap, levels=20, base_qty=20000, price_range=10)
+inject_initial_liquidity(order_book_twap, levels=20, base_qty=20000, price_range=10)
+
+
+if __name__ == '__main__':
+    tracemalloc.start()
+    logging.info("[START] Initializing the order book and starting simulation...")
+
+    try:
+        # Initialise VWAP order book and inject ask orders
+        order_book_vwap = OrderBook(transaction_cost=0.0001)
+        order_book_vwap.ask(110, 1, 7000, 250)  
+        order_book_vwap.ask(115, 2, 8000, 260)
+
+        # Execute VWAP strategy
+        logging.info("[VWAP STRATEGY] Executing VWAP strategy independently...")
+        execute_vwap_strategy(order_book_vwap, msft_prices, dfVolumes, total_order_value=50000000)
+        vwap_summary = order_book_vwap.numerical_output()
+        logging.info(f"VWAP Strategy Performance Summary: {vwap_summary}")
+
+        # Initialise TWAP order book and inject ask orders
+        order_book_twap = OrderBook(transaction_cost=0.0001)
+        order_book_twap.ask(110, 1, 5000, 250)
+        order_book_twap.ask(115, 2, 6000, 260)
+        
+        # Execute TWAP strategy
+        logging.info("[TWAP STRATEGY] Executing TWAP strategy independently...")
+        execute_twap_strategy(order_book_twap, msft_prices, dfVolumes, total_order_value=50000000, time_period=20)
+        twap_summary = order_book_twap.numerical_output()
+        logging.info(f"TWAP Strategy Performance Summary: {twap_summary}")
+
+        # Compare VWAP and TWAP Strategies
+        def compare_strategies(vwap_summary, twap_summary):
+            return {
+                key: (vwap_summary.get(key, 0) - twap_summary.get(key, 0)) 
+                for key in vwap_summary
+            }
+
+        logging.info("[COMPARISON] Comparing VWAP vs TWAP...")
+        comparison_summary = compare_strategies(vwap_summary, twap_summary)
+        logging.info(f"VWAP vs TWAP Comparison Summary: {comparison_summary}")
+        print("VWAP vs TWAP Comparison:", comparison_summary)
+
+    except Exception as e:
+        logging.error(f"An error occurred during the simulation: {e}", exc_info=True)
+    
+    finally:
+        # Memory usage and performance tracking
+        snapshot = tracemalloc.take_snapshot()
+        top_stats = snapshot.statistics('lineno')
+        logging.info("[MEMORY USAGE] Top 10 memory usage lines:")
+        for stat in top_stats[:10]:
+            logging.info(stat)
+
+        logging.info("[END] Simulation completed.")
