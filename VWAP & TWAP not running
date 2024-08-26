@@ -32,6 +32,7 @@ MAX_MEMORY_PERCENT = 80
 CHECK_INTERVAL = 1  # Check every second
 
 def monitor_resources():
+    """Monitors system resources and intervenes if thresholds are exceeded."""
     while True:
         cpu_percent = psutil.cpu_percent(interval=1)
         memory_percent = psutil.virtual_memory().percent
@@ -67,7 +68,7 @@ if ram_gb < 20:
 else:
   print('You are using a high-RAM runtime!')
 
-  # Section 1: Setup and Spread Calibration with Adjustments
+# Section 1: Setup and Spread Calibration with Adjustments
 
 # Fetch and prepare intraday data for MSFT (60-minute intervals)
 msft_data = yf.download('MSFT', start='2023-08-01', end='2023-08-31', interval='60m', progress=False).dropna(subset=['Adj Close', 'Volume'])
@@ -296,7 +297,7 @@ class Tree:
 
         return trades
 
-        # Section 3: Order Simulation
+# Section 3: Order Simulation
 
 # Configure logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(message)s', handlers=[
@@ -451,7 +452,7 @@ def execute_twap_strategy(order_book, msft_prices, dfVolumes, total_order_value=
     if match_count == 0:
         logging.warning("No trades were matched. Consider increasing price flexibility or participation rate.")
 
-        # Section 4: Order Book Operations
+# Section 4: Order Book Operations
 
 MIN_PRICE_DIFFERENCE = 0.001  # Minimum difference between prices for valid match
 MIN_ORDER_SIZE = 0.5  # Minimum order size
@@ -674,7 +675,13 @@ class OrderBook:
             "total_trades": 0
         }
 
+
 # Section 5: Run the simulation
+
+# Initialise the VWAP and TWAP order books before injecting liquidity
+order_book_vwap = OrderBook(transaction_cost=0.0001)
+order_book_twap = OrderBook(transaction_cost=0.0001)
+
 def inject_initial_liquidity(order_book, levels=10, base_qty=20000, price_range=5):
     mid_price = order_book.get_mid_price() or 250  # Default mid price if none exists
     for i in range(1, levels + 1):
@@ -683,32 +690,21 @@ def inject_initial_liquidity(order_book, levels=10, base_qty=20000, price_range=
         order_book.bid(1000 + i, i, base_qty * i, mid_price - price_offset)
         order_book.ask(2000 + i, i, base_qty * i, mid_price + price_offset)
 
-# Initialize and inject liquidity into the VWAP and TWAP order books
+# Inject liquidity into the VWAP and TWAP order books
 inject_initial_liquidity(order_book_vwap, levels=20, base_qty=20000, price_range=10)
 inject_initial_liquidity(order_book_twap, levels=20, base_qty=20000, price_range=10)
-
 
 if __name__ == '__main__':
     tracemalloc.start()
     logging.info("[START] Initializing the order book and starting simulation...")
 
     try:
-        # Initialise VWAP order book and inject ask orders
-        order_book_vwap = OrderBook(transaction_cost=0.0001)
-        order_book_vwap.ask(110, 1, 7000, 250)  
-        order_book_vwap.ask(115, 2, 8000, 260)
-
         # Execute VWAP strategy
         logging.info("[VWAP STRATEGY] Executing VWAP strategy independently...")
         execute_vwap_strategy(order_book_vwap, msft_prices, dfVolumes, total_order_value=50000000)
         vwap_summary = order_book_vwap.numerical_output()
         logging.info(f"VWAP Strategy Performance Summary: {vwap_summary}")
 
-        # Initialise TWAP order book and inject ask orders
-        order_book_twap = OrderBook(transaction_cost=0.0001)
-        order_book_twap.ask(110, 1, 5000, 250)
-        order_book_twap.ask(115, 2, 6000, 260)
-        
         # Execute TWAP strategy
         logging.info("[TWAP STRATEGY] Executing TWAP strategy independently...")
         execute_twap_strategy(order_book_twap, msft_prices, dfVolumes, total_order_value=50000000, time_period=20)
