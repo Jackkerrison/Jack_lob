@@ -24,82 +24,73 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 
 # Section 1: Setup and Spread Calibration
-# Fetch MSFT historical data
-msft_prices = yf.download('MSFT', start='2023-01-01', end='2023-08-01', progress=False)['Adj Close']
+# Fetch and prepare intraday data for MSFT (60-minute intervals)
+msft_data = yf.download('MSFT', start='2023-08-01', end='2023-08-31', interval='60m', progress=False).dropna(subset=['Adj Close', 'Volume'])
 
-# Calculate estimated spread and log returns
-estimated_spread = msft_prices * 0.0003
-returns = np.log(msft_prices).diff().dropna()
+# Calculate percentage returns for GARCH model calibration
+returns = msft_data['Adj Close'].pct_change().dropna()
 
+# Fit a GARCH(1,1) model to the intraday returns
+garch_fitted = arch_model(returns * 100, vol='Garch', p=1, q=1, dist='normal').fit(disp='off')
+volatility = garch_fitted.conditional_volatility / 100  # Convert back to original scale
+
+# Align data and calculate the spread
+aligned_data = pd.concat([msft_data['Adj Close'], msft_data['Volume'], volatility], axis=1).dropna()
+aligned_data.columns = ['Adj Close', 'Volume', 'Volatility']
+aligned_data['Spread'] = aligned_data['Adj Close'] * 0.001 * (1 + aligned_data['Volatility'] * 0.5)
+
+# Define and apply time-of-day spread adjustment
+def time_of_day_spread_adjustment(index):
+    time_fraction = (index % 390) / 390
+    return 1 + 0.2 * np.sin(2 * np.pi * time_fraction - np.pi / 2)
+
+aligned_data['Spread'] *= [time_of_day_spread_adjustment(i) for i in range(len(aligned_data))]
+
+# Generate mid prices with adjusted noise factor
+np.random.seed(42)
+aligned_data['Mid_Price'] = aligned_data['Adj Close'] + np.random.normal(
+    0, aligned_data['Volatility'] * aligned_data['Adj Close'] * 0.3
+).clip(min=0)  # Prevent negative prices
+
+# Generate bid and ask prices across multiple levels
 num_levels = 10
+level_multipliers = 1 + np.arange(num_levels) / num_levels * 0.3
 
-# Fit GARCH model and extract volatility
-garch_fitted = arch_model(returns, vol='Garch', p=1, q=1).fit(disp="off")
-volatility = garch_fitted.conditional_volatility
+bid_prices = aligned_data['Mid_Price'].values[:, None] - aligned_data['Spread'].values[:, None] * level_multipliers / 2
+ask_prices = aligned_data['Mid_Price'].values[:, None] + aligned_data['Spread'].values[:, None] * level_multipliers / 2
 
-# Prepare price series and snapshots
-num_snapshots = len(volatility)
-price_series = msft_prices[-num_snapshots:].values + np.random.normal(0, volatility * 0.2, num_snapshots)
+# Define and apply time-of-day liquidity adjustment
+def time_of_day_liquidity_adjustment(index):
+    time_fraction = (index % 390) / 390
+    return 1 + 0.25 * np.cos(2 * np.pi * time_fraction)
 
-# Dynamic spread model based on volatility and time of day
-def dynamic_spread_model(index, time_of_day_factor):
-    base_spread = estimated_spread[index]
-    spread = base_spread + (volatility[index] * 0.05) + (base_spread * time_of_day_factor)
-    return spread
-
-# Time-dependent intensity function for liquidity and volatility patterns
-def generate_time_dependent_intensity(timestamp):
-    return (np.sin(2 * np.pi * timestamp / (num_snapshots / 2)) + 1.1) * np.random.uniform(0.98, 1.02)
-
-# Generate bid and ask prices
-bid_prices = []
-ask_prices = []
-for i in range(num_snapshots):
-    time_of_day_factor = generate_time_dependent_intensity(i)
-    spread = dynamic_spread_model(i, time_of_day_factor)
-    
-    bid_base = price_series[i] - spread / 2
-    ask_base = price_series[i] + spread / 2
-    
-    bid_prices.append(np.sort(bid_base - np.random.uniform(0, 0.0002, num_levels))[::-1])
-    ask_prices.append(np.sort(ask_base + np.random.uniform(0, 0.0002, num_levels)))
-
-bid_prices = np.array(bid_prices)
-ask_prices = np.array(ask_prices)
-
-# Generate order sizes and inject random liquidity
-def generate_order_size():
-    return np.random.lognormal(mean=5.8, sigma=0.3)
-
-def inject_random_liquidity(volumes):
-    return volumes + np.random.lognormal(mean=4.8, sigma=0.3, size=volumes.shape)
+liquidity_adjustments = np.array([time_of_day_liquidity_adjustment(i) for i in range(len(aligned_data))])
+level_decay = np.exp(-np.arange(num_levels) / 6)
 
 # Generate bid and ask volumes
-bid_volumes = np.array([inject_random_liquidity(np.random.poisson(lam=generate_order_size() * generate_time_dependent_intensity(i), size=num_levels)) for i in range(num_snapshots)])
-ask_volumes = np.array([inject_random_liquidity(np.random.poisson(lam=generate_order_size() * generate_time_dependent_intensity(i), size=num_levels)) for i in range(num_snapshots)])
+base_volume = aligned_data['Volume'].values / 50
+bid_volumes = base_volume[:, None] * liquidity_adjustments[:, None] * level_decay * np.random.uniform(0.98, 1.02, (len(aligned_data), num_levels))
+ask_volumes = bid_volumes.copy()
 
-# Convert to DataFrames
-dfBidPrices = pd.DataFrame(bid_prices)
-dfAskPrices = pd.DataFrame(ask_prices)
-dfBidVolumes = pd.DataFrame(bid_volumes)
-dfAskVolumes = pd.DataFrame(ask_volumes)
+# Create DataFrames for bid and ask prices and volumes
+df_bid_prices = pd.DataFrame(bid_prices, columns=[f'Bid_Price_{i+1}' for i in range(num_levels)])
+df_ask_prices = pd.DataFrame(ask_prices, columns=[f'Ask_Price_{i+1}' for i in range(num_levels)])
+df_bid_volumes = pd.DataFrame(bid_volumes, columns=[f'Bid_Volume_{i+1}' for i in range(num_levels)])
+df_ask_volumes = pd.DataFrame(ask_volumes, columns=[f'Ask_Volume_{i+1}' for i in range(num_levels)])
+
+# Combine the bid and ask prices and volumes into a single DataFrame
+order_book = pd.concat([aligned_data[['Mid_Price', 'Spread']], df_bid_prices, df_ask_prices, df_bid_volumes, df_ask_volumes], axis=1)
+
+# Validation checks to ensure no negative or zero prices and volumes
+assert (order_book.filter(like='Price') <= 0).sum().sum() == 0, "Negative or zero prices found."
+assert (order_book.filter(like='Volume') < 0).sum().sum() == 0, "Negative volumes found."
+
+# Summary statistics
+order_book_summary = aligned_data.describe().transpose()
 
 # Output data verification
-print("First few rows of dfBidPrices:\n", dfBidPrices.head())
-print("First few rows of dfAskPrices:\n", dfAskPrices.head())
-print("First few rows of dfBidVolumes:\n", dfBidVolumes.head())
-print("First few rows of dfAskVolumes:\n", dfAskVolumes.head())
-
-# Check for zeros and NaNs in data
-print("Number of zeros in dfBidPrices:", (dfBidPrices == 0).sum().sum())
-print("Number of zeros in dfAskPrices:", (dfAskPrices == 0).sum().sum())
-print("Number of zeros in dfBidVolumes:", (dfBidVolumes == 0).sum().sum())
-print("Number of zeros in dfAskVolumes:", (dfAskVolumes == 0).sum().sum())
-
-print("Number of NaNs in dfBidPrices:", dfBidPrices.isna().sum().sum())
-print("Number of NaNs in dfAskPrices:", dfAskPrices.isna().sum().sum())
-print("Number of NaNs in dfBidVolumes:", dfBidVolumes.isna().sum().sum())
-print("Number of NaNs in dfAskVolumes:", dfAskVolumes.isna().sum().sum())
+print("First few rows of order book:\n", order_book.head())
+print("Order book summary:\n", order_book_summary)
 
 # Section 2: Order Matching and Execution
 
